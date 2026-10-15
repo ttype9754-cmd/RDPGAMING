@@ -36,14 +36,36 @@ jobs:
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
          
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
          
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
+          }
+
+      - name: Force Create RDP User Profile
+        run: |
+          $username = "RDP"
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential($username, $securePass)
+
+          Write-Host "Forcing profile creation for $username..."
+          try {
+              Start-Process -FilePath "cmd.exe" -ArgumentList "/c","exit" -Credential $cred -Wait -NoNewWindow -ErrorAction Stop
+              Write-Host "Profile creation command finished."
+          } catch {
+              Write-Host "Warning: Could not force profile via Start-Process: $($_.Exception.Message)"
+          }
+
+          Start-Sleep -Seconds 5
+          if (Test-Path "C:\Users\RDP") {
+              Write-Host "✅ Profile folder created: C:\Users\RDP"
+          } else {
+              Write-Host "⚠️ Profile folder still missing – will try again later or use Public Desktop as fallback."
           }
 
       - name: Install Tailscale
@@ -87,7 +109,7 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection + Watch RDP User
+      - name: Maintain Connection + Setup Downloads.bat
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
@@ -100,7 +122,12 @@ jobs:
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
 
-          while ($true) {
+          # Try a few times for the profile (in case the force step was slow)
+          $maxTries = 6
+          $tries = 0
+          $placed = $false
+
+          while ($tries -lt $maxTries -and -not $placed) {
               if (Test-Path $rdpProfile) {
                   try {
                       if (-not (Test-Path $startupPath)) {
@@ -110,10 +137,10 @@ jobs:
                       Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
                       Write-Host "✅ Downloads.bat copied to $downloadPath"
 
-                      # Run the batch file for the first time
+                      # Run the batch file once now
                       cmd /c $downloadPath
                       Write-Host "✅ Downloads.bat executed successfully"
-                      break
+                      $placed = $true
                   }
                   catch {
                       Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
@@ -121,9 +148,19 @@ jobs:
                   }
               }
               else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile... (try $($tries+1)/$maxTries)"
+                  Start-Sleep -Seconds 15
+                  $tries++
               }
+          }
+
+          if (-not $placed) {
+              Write-Host "⚠️ Could not place Downloads.bat in user Startup. Falling back to Public Desktop."
+              $publicDesktop = "C:\Users\Public\Desktop"
+              if (-not (Test-Path $publicDesktop)) { New-Item -ItemType Directory -Path $publicDesktop -Force | Out-Null }
+              $fallbackPath = "$publicDesktop\Downloads.bat"
+              Invoke-WebRequest -Uri $downloadUrl -OutFile $fallbackPath -UseBasicParsing
+              Write-Host "✅ Downloads.bat saved to $fallbackPath (run it manually after connecting)"
           }
 
           # Keep runner alive
